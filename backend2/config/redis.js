@@ -1,7 +1,10 @@
 import net from "net";
+import tls from "tls";
+
 /**
  * High-performance Cache Service implementing Redis RESP protocol
- * with transparent In-Memory fallback and Cache Stampede protection.*/
+ * with transparent In-Memory fallback and Cache Stampede protection.
+ */
 class RedisClient {
   constructor() {
     this.memoryStore = new Map();
@@ -10,7 +13,7 @@ class RedisClient {
     this.socket = null;
     this.pendingCallbacks = [];
     this.buffer = "";
-    
+
     setInterval(() => this.cleanupMemoryStore(), 30000).unref();
 
     this.initRedis();
@@ -18,36 +21,93 @@ class RedisClient {
 
   initRedis() {
     try {
-      const url = new URL(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+      if (!process.env.REDIS_URL) {
+        return;
+      }
+
+      const url = new URL(process.env.REDIS_URL);
+      const isTls = url.protocol === "rediss:" || url.hostname.includes("upstash.io");
       const host = url.hostname || "127.0.0.1";
-      const port = parseInt(url.port || "6379", 10);
+      const port = parseInt(url.port || (isTls ? "6379" : "6379"), 10);
 
-      this.socket = new net.Socket();
-      this.socket.setTimeout(2000);
+      const netModule = isTls ? tls : net;
+      const options = isTls ? { rejectUnauthorized: false } : {};
 
-      this.socket.connect(port, host, () => {
-        this.isRedisConnected = true;
-        console.log(`[Cache] Connected to Redis at ${host}:${port}`);
-      });
+      const socket = isTls
+        ? tls.connect(port, host, options)
+        : net.createConnection(port, host);
+
+      this.socket = socket;
+      this.socket.setTimeout(3000);
+
+      const handleConnect = () => {
+        if (url.password) {
+          const user = url.username || "default";
+          const authCmd = `*3\r\n$4\r\nAUTH\r\n$${Buffer.byteLength(user)}\r\n${user}\r\n$${Buffer.byteLength(url.password)}\r\n${url.password}\r\n`;
+          this.socket.write(authCmd);
+        } else {
+          this.socket.write("*1\r\n$4\r\nPING\r\n");
+        }
+      };
+
+      if (isTls) {
+        this.socket.on("secureConnect", handleConnect);
+      } else {
+        this.socket.on("connect", handleConnect);
+      }
 
       this.socket.on("data", (data) => {
-        this.handleRedisData(data.toString());
+        const text = data.toString();
+        if (!this.isRedisConnected) {
+          if (text.includes("+OK") || text.includes("+PONG")) {
+            this.isRedisConnected = true;
+            console.log(`[Cache] Connecté à Redis avec succès (${host}:${port})`);
+          } else if (text.startsWith("-ERR") || text.startsWith("-WRONGPASS") || text.startsWith("-NOAUTH")) {
+            console.warn(`[Cache] Authentification Redis échouée (${text.trim()}), bascule sur cache mémoire.`);
+            this.isRedisConnected = false;
+            this.flushCallbacks();
+            if (this.socket) {
+              this.socket.destroy();
+              this.socket = null;
+            }
+          }
+          return;
+        }
+        this.handleRedisData(text);
       });
 
       this.socket.on("timeout", () => {
-        this.socket.destroy();
+        this.isRedisConnected = false;
+        this.flushCallbacks();
+        if (this.socket) {
+          this.socket.destroy();
+          this.socket = null;
+        }
       });
 
       this.socket.on("error", () => {
         this.isRedisConnected = false;
-        
+        this.flushCallbacks();
       });
 
       this.socket.on("close", () => {
         this.isRedisConnected = false;
+        this.flushCallbacks();
       });
     } catch (err) {
       this.isRedisConnected = false;
+      this.flushCallbacks();
+    }
+  }
+
+  flushCallbacks() {
+    while (this.pendingCallbacks.length > 0) {
+      const cb = this.pendingCallbacks.shift();
+      try {
+        cb(null);
+      } catch (err) {
+        // ignore
+      }
     }
   }
 
@@ -68,6 +128,7 @@ class RedisClient {
       }
     }
   }
+
   /**
    * Get a cached string value
    * @param {string} key
@@ -76,16 +137,24 @@ class RedisClient {
   async get(key) {
     if (this.isRedisConnected && this.socket) {
       try {
-        return await new Promise((resolve) => {
+        const redisValue = await new Promise((resolve) => {
+          const timer = setTimeout(() => resolve(null), 500);
+
           this.pendingCallbacks.push((res) => {
-            if (res.startsWith("$-1")) return resolve(null);
+            clearTimeout(timer);
+            if (!res || res.startsWith("$-1") || res.startsWith("-")) return resolve(null);
             const lines = res.split("\r\n");
             resolve(lines[1] || null);
           });
+
           this.socket.write(`*2\r\n$3\r\nGET\r\n$${Buffer.byteLength(key)}\r\n${key}\r\n`);
         });
+
+        if (redisValue !== null) {
+          return redisValue;
+        }
       } catch (err) {
-        
+        // Fallback to memory
       }
     }
 
@@ -97,6 +166,7 @@ class RedisClient {
     }
     return item.value;
   }
+
   /**
    * Set a cached value with optional TTL
    * @param {string} key
@@ -114,7 +184,7 @@ class RedisClient {
         )}\r\n${strValue}\r\n$2\r\nEX\r\n$${ttlSeconds.toString().length}\r\n${ttlSeconds}\r\n`;
         this.socket.write(cmd);
       } catch (err) {
-        
+        // Fallback
       }
     }
 
@@ -122,6 +192,7 @@ class RedisClient {
     this.memoryStore.set(key, { value: strValue, expiresAt });
     return "OK";
   }
+
   /**
    * Delete a key
    * @param {string} key
@@ -137,6 +208,7 @@ class RedisClient {
     this.memoryStore.delete(key);
     return 1;
   }
+
   /**
    * Delete keys matching wildcard pattern 
    * @param {string} pattern
@@ -149,6 +221,7 @@ class RedisClient {
       }
     }
   }
+
   /**
    * Increment numeric counter
    * @param {string} key
@@ -163,6 +236,7 @@ class RedisClient {
     });
     return val;
   }
+
   /**
    * Set expiration in seconds
    * @param {string} key
@@ -177,15 +251,21 @@ class RedisClient {
     }
     return 0;
   }
+
   /** * Close connections */
   close() {
+    this.isRedisConnected = false;
+    this.flushCallbacks();
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
     }
   }
-  /** * Cache Stampede protection 
-   * Prevents multiple concurrent slow DB queries for the same key.*/
+
+  /**
+   * Cache Stampede protection 
+   * Prevents multiple concurrent slow DB queries for the same key.
+   */
   async withStampedeProtection(key, fetchFn) {
     if (this.inFlightLocks.has(key)) {
       return await this.inFlightLocks.get(key);
